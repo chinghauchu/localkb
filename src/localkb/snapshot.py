@@ -43,10 +43,30 @@ class Plan:
 
 
 def atomic_write_json(path: Path, payload: object) -> None:
+    """Write JSON via a temp file, fsync, and replace. Keeps the existing mode."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    data = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    mode = (path.stat().st_mode & 0o777) if path.exists() else 0o644
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, mode)
     temporary.replace(path)
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            # Some filesystems cannot fsync a directory. The file fsync already landed.
+            return
+    finally:
+        os.close(descriptor)
 
 
 def sha256_file(path: Path) -> str:
@@ -79,7 +99,7 @@ def scan_folder(folder: Path) -> dict[str, ScannedFile]:
 
 
 def is_unchanged(manifest: dict[str, dict[str, object]], scanned: dict[str, ScannedFile]) -> bool:
-    """True when every path, size, and mtime matches. Callers can skip hashing."""
+    """True when every path, size, and mtime matches and no file previously failed to parse."""
     if len(manifest) != len(scanned):
         return False
     for rel, item in scanned.items():
@@ -87,6 +107,8 @@ def is_unchanged(manifest: dict[str, dict[str, object]], scanned: dict[str, Scan
         if prev is None:
             return False
         if prev["size"] != item.size or prev["mtime_ns"] != item.mtime_ns:
+            return False
+        if prev.get("error"):
             return False
     return True
 
@@ -110,7 +132,11 @@ def plan_changes(old: dict[str, dict[str, object]], scanned: dict[str, ScannedFi
         prev = old[rel]
         cur = scanned[rel]
         if cur.size == prev["size"] and cur.mtime_ns == prev["mtime_ns"]:
-            unchanged.append(rel)
+            # Retry a file that failed to parse even when its bytes did not change.
+            if prev.get("error"):
+                modified.append(rel)
+            else:
+                unchanged.append(rel)
         elif cur.sha256 == prev["sha256"]:
             touched.append(rel)
         else:

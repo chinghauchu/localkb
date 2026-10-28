@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from localkb.errors import LocalKBError
@@ -27,6 +29,7 @@ class InstallResult:
     path: Path
     backup: Path | None
     client: str
+    warning: str | None = None
 
     def format(self) -> str:
         lines = [f"Wrote {self.path}"]
@@ -34,6 +37,8 @@ class InstallResult:
             lines.append(f"Backup: {self.backup}")
         lines.append(_RESTART[self.client])
         lines.append("The config points at this folder. If you move the folder, run install again.")
+        if self.warning:
+            lines.append(self.warning)
         return "\n".join(lines)
 
 
@@ -60,19 +65,34 @@ def config_path_for(client: str, *, home: Path, platform: str) -> Path:
     raise LocalKBError(f"unknown client {client!r}; choose {', '.join(CLIENTS)}")
 
 
-def server_command(folder: Path) -> tuple[str, list[str]]:
+def server_command(folder: Path) -> tuple[str, list[str], str | None]:
+    """Return the MCP command, its args, and a warning when the command is provisional.
+
+    ``uvx`` runs from a temporary environment. Writing that interpreter path into a
+    client config breaks as soon as the process exits, so the config calls
+    ``uvx localkb serve`` instead.
+    """
     folder_arg = str(folder.resolve())
+    if _path_in_uv_cache(Path(sys.executable)):
+        uvx = shutil.which("uvx") or "uvx"
+        warning = (
+            "This process is a temporary uvx environment, so the config calls "
+            "`uvx localkb serve`. That needs localkb to be available to uvx. "
+            "For a command that outlives this process, run "
+            "`uv tool install --from <checkout> localkb` and then `localkb install` again."
+        )
+        return uvx, ["localkb", "serve", "--folder", folder_arg], warning
     executable = shutil.which("localkb")
-    if executable:
-        return executable, ["serve", "--folder", folder_arg]
-    return sys.executable, ["-m", "localkb", "serve", "--folder", folder_arg]
+    if executable and not _path_in_uv_cache(Path(executable)):
+        return executable, ["serve", "--folder", folder_arg], None
+    return sys.executable, ["-m", "localkb", "serve", "--folder", folder_arg], None
 
 
-def server_spec(folder: Path, *, client: str) -> dict[str, object]:
-    command, args = server_command(folder)
+def server_spec(folder: Path, *, client: str) -> tuple[dict[str, object], str | None]:
+    command, args, warning = server_command(folder)
     if client == "vscode":
-        return {"type": "stdio", "command": command, "args": args}
-    return {"command": command, "args": args}
+        return {"type": "stdio", "command": command, "args": args}, warning
+    return {"command": command, "args": args}, warning
 
 
 def install_client(
@@ -96,15 +116,44 @@ def install_client(
         raise LocalKBError(f"{path} key {key!r} is not a JSON object; it was left unchanged")
     backup: Path | None = None
     if existed:
-        backup = path.with_name(path.name + ".bak")
+        backup = _backup_path(path)
         shutil.copy2(path, backup)
     if servers is None:
         servers = {}
         data[key] = servers
-    servers["localkb"] = server_spec(folder, client=client)
+    spec, warning = server_spec(folder, client=client)
+    servers["localkb"] = spec
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, data)
-    return InstallResult(path=path, backup=backup, client=client)
+    return InstallResult(path=path, backup=backup, client=client, warning=warning)
+
+
+def _backup_path(path: Path) -> Path:
+    """A new backup path. Never reuses ``name.bak`` or an existing timestamped backup."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = path.with_name(f"{path.name}.bak-{stamp}")
+    suffix = 0
+    while candidate.exists():
+        suffix += 1
+        candidate = path.with_name(f"{path.name}.bak-{stamp}-{suffix}")
+    return candidate
+
+
+def _uv_cache_dir() -> Path:
+    override = os.environ.get("UV_CACHE_DIR")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".cache"
+    return base / "uv"
+
+
+def _path_in_uv_cache(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(_uv_cache_dir().resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _read_config(path: Path) -> tuple[dict[str, object], bool]:

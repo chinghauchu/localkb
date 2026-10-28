@@ -12,6 +12,15 @@ def test_cjk_bigrams_leave_english_words() -> None:
     assert "revenue" in indexed
 
 
+def test_mixed_script_runs_are_padded_and_kana_hangul_split() -> None:
+    mixed = cjk_index_text("Q3營收")
+    assert "Q3" in mixed
+    assert " 營收 " in mixed
+    assert "カタ" in cjk_index_text("カタカナ")
+    assert "タカ" in cjk_index_text("カタカナ")
+    assert "한글" in cjk_index_text("한글검색")
+
+
 def test_fts_query_ors_content_words() -> None:
     query = fts_query("the quarterly revenue 本季營收")
     assert query is not None

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
+from localkb.chunk import chunk_id
 from localkb.errors import LocalKBError
 from localkb.models import Hit
 from localkb.snapshot import atomic_write_json
@@ -51,6 +52,13 @@ class Index:
             yield conn
             if write:
                 conn.execute("COMMIT")
+        except sqlite3.Error as exc:
+            if write:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            raise LocalKBError(f"index database error: {exc}") from exc
         except Exception:
             if write:
                 try:
@@ -124,8 +132,42 @@ class Index:
         conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
         conn.execute("DELETE FROM files WHERE path = ?", (path,))
 
-    def rename_file(self, conn: sqlite3.Connection, old: str, new: str) -> None:
-        conn.execute("UPDATE chunks SET path = ? WHERE path = ?", (new, old))
+    def rename_file(self, conn: sqlite3.Connection, old: str, new: str, file_sha: str) -> None:
+        """Point chunks at ``new`` and recompute path-aware ids. Vectors are copied, not rebuilt."""
+        rows = conn.execute(
+            """
+            SELECT locator_type, locator, text, body, vector, ord
+            FROM chunks WHERE path = ? ORDER BY ord
+            """,
+            (old,),
+        ).fetchall()
+        conn.execute("DELETE FROM chunks WHERE path = ?", (old,))
+        conn.executemany(
+            """
+            INSERT INTO chunks(id, path, locator_type, locator, text, body, vector, ord)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    chunk_id(
+                        new,
+                        file_sha,
+                        str(row["locator_type"]),
+                        str(row["locator"]),
+                        int(row["ord"]),
+                        str(row["text"]),
+                    ),
+                    new,
+                    row["locator_type"],
+                    row["locator"],
+                    row["text"],
+                    row["body"],
+                    row["vector"],
+                    row["ord"],
+                )
+                for row in rows
+            ],
+        )
         conn.execute("UPDATE files SET path = ? WHERE path = ?", (new, old))
 
     def touch_file(self, conn: sqlite3.Connection, path: str, size: int, mtime_ns: int) -> None:

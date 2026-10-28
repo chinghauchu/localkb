@@ -2,10 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from localkb.textutil import normalize_text, split_window
 
 DEFAULT_CHUNK_SIZE = 800
 DEFAULT_CHUNK_OVERLAP = 120
+
+
+def chunk_id(
+    path: str,
+    file_sha: str,
+    locator_type: str,
+    locator: str,
+    ordinal: int,
+    text: str,
+) -> str:
+    """Stable id that includes the path, so identical files do not share a primary key.
+
+    A rename recomputes the id from the new path and keeps the stored vector.
+    """
+    raw = "\n".join((path, file_sha, locator_type, locator, str(ordinal), text))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 def chunk_text(

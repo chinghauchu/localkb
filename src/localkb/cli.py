@@ -97,6 +97,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="bearer token for HTTP mode (or set LOCALKB_TOKEN)",
     )
+    serve.add_argument(
+        "--generate-token",
+        action="store_true",
+        help="generate a bearer token and print it to stderr",
+    )
+    serve.add_argument(
+        "--insecure-no-token",
+        action="store_true",
+        help="allow HTTP with no token, only on 127.0.0.1",
+    )
     serve.set_defaults(handler=_cmd_serve)
 
     install = commands.add_parser("install", help="add localkb to an MCP client config")
@@ -168,14 +178,20 @@ def _cmd_ask(args: argparse.Namespace) -> int:
 def _cmd_serve(args: argparse.Namespace) -> int:
     import os
 
-    from localkb.mcp_server import serve_http, serve_stdio
+    from localkb.mcp_server import resolve_http_auth, serve_http, serve_stdio
 
     folder = _optional_folder(args.folder)
     if args.http:
         if args.port < 1 or args.port > 65535:
             raise LocalKBError("port must be between 1 and 65535")
-        token = args.token if args.token is not None else os.environ.get("LOCALKB_TOKEN")
-        serve_http(folder, host=args.host, port=args.port, token=token or None)
+        supplied = args.token if args.token is not None else os.environ.get("LOCALKB_TOKEN")
+        token = resolve_http_auth(
+            host=args.host,
+            token=supplied or None,
+            insecure_no_token=args.insecure_no_token,
+            generate_token=args.generate_token,
+        )
+        serve_http(folder, host=args.host, port=args.port, token=token)
         return 0
     if args.token:
         raise LocalKBError("--token is only used with --http")

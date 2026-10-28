@@ -11,13 +11,13 @@ from pathlib import Path
 from typing import Protocol
 
 from localkb.errors import LocalKBError
-from localkb.textutil import cjk_index_text, split_window
+from localkb.textutil import CJK_CHAR_CLASS, cjk_index_text, split_window
 
 DEFAULT_EMBEDDER = "fastembed"
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 # MiniLM truncates at 128 tokens. Windows stay under that for both English and CJK,
 # then the chunk vector is the normalized mean so longer excerpts still embed.
-_CJK_CHAR = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+_CJK_CHAR = re.compile(f"[{CJK_CHAR_CLASS}]")
 
 _MODELS: dict[tuple[str, str], object] = {}
 _MODEL_LOCK = threading.Lock()

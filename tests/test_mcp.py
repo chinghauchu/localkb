@@ -3,9 +3,18 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 from starlette.testclient import TestClient
 
-from localkb.mcp_server import INSTRUCTIONS, build_server, create_http_app, http_banner
+from localkb.cli import run
+from localkb.errors import LocalKBError
+from localkb.mcp_server import (
+    INSTRUCTIONS,
+    build_server,
+    create_http_app,
+    http_banner,
+    resolve_http_auth,
+)
 
 
 def _payload(result) -> dict:
@@ -39,7 +48,9 @@ def test_mcp_tools_return_citations(corpus: Path) -> None:
         assert hit["id"]
         assert hit["score"] > 0
         assert hit["title"]
-        assert hit["url"].startswith("file:")
+        assert hit["url"].startswith("localkb:///")
+        assert "file:" not in hit["url"]
+        assert str(corpus) not in hit["url"]
 
         fetched = await server.call_tool("fetch", {"id": hit["id"]})
         full = _payload(fetched)
@@ -59,13 +70,15 @@ def test_mcp_tools_return_citations(corpus: Path) -> None:
         info = _payload(status)
         assert info["files"] == 6
         assert info["model"] == "hash-v1"
+        assert "folder" not in info
+        assert str(corpus) not in json.dumps(info)
 
     asyncio.run(call())
 
 
 def test_http_requires_bearer_token(corpus: Path) -> None:
     app = create_http_app(corpus, token="secret", host="127.0.0.1")
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         health = client.get("/health")
         assert health.status_code == 200
         assert health.json()["ok"] is True
@@ -77,13 +90,60 @@ def test_http_requires_bearer_token(corpus: Path) -> None:
             json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
         )
         assert allowed.status_code != 401
+        rejected_host = client.post(
+            "/mcp",
+            headers={"Authorization": "Bearer secret", "Host": "evil.example"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        )
+        assert rejected_host.status_code == 421
 
 
 def test_http_banner_warns_about_tunnels() -> None:
-    text = http_banner("127.0.0.1", 8765, token_set=False)
+    text = http_banner("127.0.0.1", 8765)
     assert "tunnel" in text.lower()
-    assert "bearer token" in text.lower()
-    assert "No bearer token" in text
+    assert "token" in text.lower()
+    assert "Host" in text
+
+
+def test_http_auth_policy(corpus: Path, monkeypatch) -> None:
+    monkeypatch.delenv("LOCALKB_TOKEN", raising=False)
+    assert run(["serve", "--http", "--folder", str(corpus)]) == 1
+    assert (
+        run(
+            ["serve", "--http", "--host", "0.0.0.0", "--insecure-no-token", "--folder", str(corpus)]
+        )
+        == 1
+    )
+    with pytest.raises(LocalKBError, match="only allowed"):
+        resolve_http_auth(
+            host="192.0.2.10",
+            token=None,
+            insecure_no_token=True,
+            generate_token=False,
+        )
+    assert (
+        resolve_http_auth(
+            host="127.0.0.1",
+            token=None,
+            insecure_no_token=True,
+            generate_token=False,
+        )
+        is None
+    )
+    with pytest.raises(LocalKBError, match="all interfaces"):
+        resolve_http_auth(
+            host="0.0.0.0",
+            token="secret",
+            insecure_no_token=False,
+            generate_token=False,
+        )
+    generated = resolve_http_auth(
+        host="192.0.2.10",
+        token=None,
+        insecure_no_token=False,
+        generate_token=True,
+    )
+    assert generated and len(generated) >= 32
 
 
 def test_stdio_client_can_search(corpus: Path) -> None:

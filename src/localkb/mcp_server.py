@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
 from localkb import __version__
+from localkb.errors import LocalKBError
 from localkb.models import Hit
 from localkb.pipeline import fetch_chunk, list_documents, require_kb, search_kb, status_kb
 
@@ -72,7 +73,6 @@ class DocumentListModel(BaseModel):
 
 
 class StatusModel(BaseModel):
-    folder: str
     files: int
     chunks: int
     embedder: str
@@ -147,7 +147,6 @@ def build_server(folder: Path):
     def status() -> StatusModel:
         info = status_kb(folder)
         return StatusModel(
-            folder=str(info["folder"]),
             files=int(info["files"]),
             chunks=int(info["chunks"]),
             embedder=str(info["embedder"]),
@@ -163,8 +162,6 @@ def serve_stdio(folder: Path) -> None:
 
 
 def create_http_app(folder: Path, *, token: str | None, host: str):
-    from mcp.server.transport_security import TransportSecuritySettings
-
     server = build_server(folder)
 
     @server.custom_route("/health", methods=["GET"], include_in_schema=False)
@@ -176,7 +173,7 @@ def create_http_app(folder: Path, *, token: str | None, host: str):
         json_response=False,
         stateless_http=True,
         host=host,
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        transport_security=_transport_security(host),
     )
     if token:
         app.add_middleware(_BearerMiddleware, token=token)
@@ -186,13 +183,48 @@ def create_http_app(folder: Path, *, token: str | None, host: str):
 def serve_http(folder: Path, *, host: str, port: int, token: str | None) -> None:
     import uvicorn
 
-    print(http_banner(host, port, token_set=bool(token)), file=sys.stderr)
+    print(http_banner(host, port), file=sys.stderr)
     app = create_http_app(folder, token=token, host=host)
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
     uvicorn.Server(config).run()
 
 
-def http_banner(host: str, port: int, *, token_set: bool) -> str:
+def resolve_http_auth(
+    *,
+    host: str,
+    token: str | None,
+    insecure_no_token: bool,
+    generate_token: bool,
+) -> str | None:
+    """Decide the bearer token for HTTP mode, or refuse to start."""
+    import secrets
+
+    if host in {"0.0.0.0", "::", ""}:
+        raise LocalKBError(
+            "refusing to bind all interfaces. Host checks compare the Host header with "
+            "--host, so pass the address clients will send, or use 127.0.0.1."
+        )
+    if insecure_no_token and (token or generate_token):
+        raise LocalKBError("--insecure-no-token cannot be combined with a token")
+    if generate_token and token:
+        raise LocalKBError("pass either --token or --generate-token, not both")
+    if generate_token:
+        token = secrets.token_urlsafe(32)
+        print(f"Generated bearer token:\n{token}", file=sys.stderr)
+    if insecure_no_token:
+        if host != "127.0.0.1":
+            raise LocalKBError("--insecure-no-token is only allowed with --host 127.0.0.1")
+        return None
+    if not token:
+        raise LocalKBError(
+            "HTTP mode requires a bearer token. Pass --token, set LOCALKB_TOKEN, "
+            "or pass --generate-token. To listen on 127.0.0.1 with no token, "
+            "pass --insecure-no-token."
+        )
+    return token
+
+
+def http_banner(host: str, port: int) -> str:
     endpoint = f"http://{host}:{port}/mcp"
     lines = [
         f"localkb HTTP mode serves indexed excerpts on {endpoint}",
@@ -200,32 +232,40 @@ def http_banner(host: str, port: int, *, token_set: bool) -> str:
         "A client receives excerpt text only when it calls a tool.",
         "",
         "A tunnel (cloudflared, ngrok, Tailscale Funnel, or ssh -R) lets a hosted "
-        "assistant such as ChatGPT reach this port. Anyone who can open that URL can "
-        "read excerpts from the knowledge base. Prefer a private network such as "
-        "Tailscale or SSH, and set a bearer token:",
+        "assistant such as ChatGPT reach this port. Anyone who can open that URL "
+        "and present the bearer token can read excerpts. Prefer a private network "
+        "such as Tailscale or SSH.",
         "",
-        '    localkb serve --http --port 8765 --token "$LOCALKB_TOKEN"',
-        "",
-        "Point the client at the /mcp URL and send Authorization: Bearer <token>.",
-        "Host checks are disabled so a tunnel can rewrite the Host header.",
-        "Bind to 127.0.0.1 unless you intend to expose the port.",
-        "Do not publish the URL or the token.",
+        "Send Authorization: Bearer <token>. Do not publish the URL or the token.",
+        "Host and Origin are checked. A tunnel must present a Host this server allows "
+        f"({host}), or the request is rejected.",
     ]
-    if not token_set:
-        lines.extend(
-            [
-                "",
-                "No bearer token is set. Any client that can reach this port can read excerpts.",
-            ]
-        )
-    if host not in {"127.0.0.1", "localhost", "::1"}:
-        lines.extend(
-            [
-                "",
-                f"The server is bound to {host}, so it is reachable beyond this machine.",
-            ]
-        )
+    if host != "127.0.0.1":
+        lines.append(f"The server is bound to {host}, so it is reachable beyond this machine.")
     return "\n".join(lines)
+
+
+def _transport_security(host: str):
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*", "127.0.0.1", "localhost", "[::1]"]
+        allowed_origins = [
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+            "http://127.0.0.1",
+            "http://localhost",
+            "http://[::1]",
+        ]
+    else:
+        allowed_hosts = [host, f"{host}:*"]
+        allowed_origins = [f"http://{host}", f"http://{host}:*"]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
 
 
 def _search_hit(folder: Path, hit: Hit) -> SearchHitModel:

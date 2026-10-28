@@ -5,7 +5,18 @@ from __future__ import annotations
 import re
 from urllib.parse import quote
 
-_CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+# Han, Hiragana, Katakana (including halfwidth), and Hangul. Bigrams cover all of these.
+CJK_CHAR_CLASS = (
+    r"\u1100-\u11ff"  # Hangul jamo
+    r"\u3040-\u30ff"  # Hiragana and Katakana
+    r"\u31f0-\u31ff"  # Katakana phonetic extensions
+    r"\u3400-\u4dbf"  # CJK extension A
+    r"\u4e00-\u9fff"  # CJK unified ideographs
+    r"\uac00-\ud7af"  # Hangul syllables
+    r"\uf900-\ufaff"  # CJK compatibility ideographs
+    r"\uff66-\uff9d"  # halfwidth katakana
+)
+_CJK_RUN = re.compile(f"[{CJK_CHAR_CLASS}]+")
 _TOKEN = re.compile(r"\w+", flags=re.UNICODE)
 
 # Short English function words drown keyword search. CJK bigrams are not in this set.
@@ -48,16 +59,20 @@ def normalize_text(text: str) -> str:
 
 
 def cjk_index_text(text: str) -> str:
-    """Insert overlapping bigrams inside CJK runs so FTS can match without spaces.
+    """Insert overlapping bigrams inside Han, kana, and Hangul runs.
 
-    「知識庫」 becomes 「知識 識庫」. English and numbers are left intact.
+    Runs are padded with spaces so a mixed token such as 「Q3營收」 is indexed as
+    ``Q3`` plus ``營收``, which matches the query 「Q3 營收」. 「知識庫」 becomes
+    「知識 識庫」. Latin words and numbers are otherwise left intact.
     """
 
     def repl(match: re.Match[str]) -> str:
         run = match.group(0)
         if len(run) == 1:
-            return run
-        return " ".join(run[i : i + 2] for i in range(len(run) - 1))
+            grams = run
+        else:
+            grams = " ".join(run[i : i + 2] for i in range(len(run) - 1))
+        return f" {grams} "
 
     return _CJK_RUN.sub(repl, text)
 
@@ -135,10 +150,9 @@ def locator_fields(locator_type: str, locator: str) -> dict[str, int | str | Non
     return {"page": page, "slide": slide, "sheet": sheet}
 
 
-def file_url(root, rel: str, locator_type: str, locator: str) -> str:
-    from pathlib import Path
-
-    uri = (Path(root) / rel).resolve().as_uri()
+def file_url(_root, rel: str, locator_type: str, locator: str) -> str:
+    """Citation URI with no machine path. ``_root`` is unused on purpose."""
+    uri = "localkb:///" + quote(rel, safe="/")
     if locator_type == "page":
         return f"{uri}#page={quote(locator)}"
     if locator_type == "slide":

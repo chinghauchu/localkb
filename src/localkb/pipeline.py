@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
+import os
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from localkb.chunk import chunk_text
+from localkb.chunk import chunk_id, chunk_text
 from localkb.embed import Embedder, create_embedder
 from localkb.errors import LocalKBError
 from localkb.extract import Section, extract_document
@@ -29,6 +30,7 @@ from localkb.textutil import cjk_index_text
 
 KB_DIRNAME = ".localkb"
 FORMAT = 1
+_EMBED_BATCH = 256
 
 
 def init_kb(
@@ -42,16 +44,10 @@ def init_kb(
     # Validate the embedder before replacing an existing knowledge base.
     embedder_impl = create_embedder(embedder, model)
     kb = _kb_dir(folder)
-    if kb.exists():
-        if not force:
-            raise LocalKBError(
-                f"{kb} already exists. Use 'localkb update' or 'localkb init --force'."
-            )
-        if not kb.is_dir():
-            raise LocalKBError(f"{kb} exists and is not a directory")
-        import shutil
-
-        shutil.rmtree(kb)
+    if kb.exists() and not force:
+        raise LocalKBError(f"{kb} already exists. Use 'localkb update' or 'localkb init --force'.")
+    if kb.exists() and not kb.is_dir():
+        raise LocalKBError(f"{kb} exists and is not a directory")
 
     started = time.perf_counter()
     scanned = scan_folder(folder)
@@ -64,16 +60,26 @@ def init_kb(
             del scanned[rel]
     plan = plan_changes({}, scanned)
     created = _now()
-    return _apply(
-        folder,
-        Index(kb / "index.sqlite"),
-        embedder_impl,
-        scanned,
-        plan,
-        started=started,
-        created=created,
-        skipped=skipped,
-    )
+    staging = folder / f".localkb-build-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    try:
+        report = _apply(
+            folder,
+            Index(staging / "index.sqlite"),
+            embedder_impl,
+            scanned,
+            plan,
+            started=started,
+            created=created,
+            skipped=skipped,
+        )
+        _replace_knowledge_base(staging, kb)
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return report
 
 
 def update_kb(folder: Path) -> Report:
@@ -169,8 +175,7 @@ def status_kb(folder: Path) -> dict[str, object]:
         files, chunks = index.counts(conn)
     index_path = kb / "index.sqlite"
     return {
-        "folder": str(folder),
-        "knowledge_base": str(kb),
+        "index": KB_DIRNAME,
         "files": files,
         "chunks": chunks,
         "embedder": meta.get("embedder"),
@@ -184,8 +189,7 @@ def status_kb(folder: Path) -> dict[str, object]:
 
 def format_status(info: dict[str, object]) -> str:
     labels = [
-        ("folder", "folder"),
-        ("knowledge_base", "knowledge base"),
+        ("index", "index"),
         ("files", "files"),
         ("chunks", "chunks"),
         ("embedder", "embedder"),
@@ -259,19 +263,14 @@ def _apply(
             skipped.append((rel, message))
             prepared[rel] = (item, [], message)
             continue
-        chunks = _sections_to_chunks(item.sha256, sections)
+        chunks = _sections_to_chunks(rel, item.sha256, sections)
         if not chunks:
             skipped.append((rel, "no text extracted"))
         prepared[rel] = (item, chunks, None)
         pending.extend(chunks)
 
     if pending:
-        if embedder.name == "fastembed":
-            print(
-                f"embedding {len(pending)} chunks with {embedder.model}...",
-                file=sys.stderr,
-            )
-        vectors = embedder.embed_documents([chunk.text for chunk in pending])
+        vectors = _embed_in_batches(embedder, pending)
         if len(vectors) != len(pending):
             raise LocalKBError("embedder returned an unexpected number of vectors")
         for chunk, vector in zip(pending, vectors, strict=True):
@@ -282,13 +281,13 @@ def _apply(
                 )
             chunk.vector = vector
 
-    kb = _kb_dir(folder)
+    kb = index.path.parent
     with index.connect(write=True) as conn:
         for rel in plan.deleted:
             index.delete_file(conn, rel)
         for old, new in plan.renamed:
-            index.rename_file(conn, old, new)
             item = scanned[new]
+            index.rename_file(conn, old, new, item.sha256)
             index.touch_file(conn, new, item.size, item.mtime_ns)
         for rel in plan.touched:
             item = scanned[rel]
@@ -303,7 +302,7 @@ def _apply(
                 error=error,
                 chunks=chunks,
             )
-        if plan.deleted or prepared:
+        if plan.deleted or prepared or plan.renamed:
             index.rebuild_fts(conn)
         files, chunk_count = index.counts(conn)
         index.export_snapshot(conn, kb / "snapshot.json")
@@ -328,7 +327,7 @@ def _apply(
     )
 
 
-def _sections_to_chunks(file_sha: str, sections: list[Section]) -> list[NewChunk]:
+def _sections_to_chunks(path: str, file_sha: str, sections: list[Section]) -> list[NewChunk]:
     chunks: list[NewChunk] = []
     ordinal = 0
     for section in sections:
@@ -340,7 +339,7 @@ def _sections_to_chunks(file_sha: str, sections: list[Section]) -> list[NewChunk
                 locator = section.locator
             chunks.append(
                 NewChunk(
-                    id=_chunk_id(file_sha, section.locator_type, locator, ordinal, piece),
+                    id=chunk_id(path, file_sha, section.locator_type, locator, ordinal, piece),
                     locator_type=section.locator_type,
                     locator=locator,
                     text=piece,
@@ -351,9 +350,36 @@ def _sections_to_chunks(file_sha: str, sections: list[Section]) -> list[NewChunk
     return chunks
 
 
-def _chunk_id(file_sha: str, locator_type: str, locator: str, ordinal: int, text: str) -> str:
-    raw = f"{file_sha}\n{locator_type}\n{locator}\n{ordinal}\n{text}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+def _embed_in_batches(embedder: Embedder, pending: list[NewChunk]) -> list[list[float]]:
+    total = len(pending)
+    vectors: list[list[float]] = []
+    for start in range(0, total, _EMBED_BATCH):
+        batch = pending[start : start + _EMBED_BATCH]
+        end = start + len(batch)
+        print(
+            f"embedding {start + 1}-{end} of {total} with {embedder.model}...",
+            file=sys.stderr,
+        )
+        vectors.extend(embedder.embed_documents([chunk.text for chunk in batch]))
+    return vectors
+
+
+def _replace_knowledge_base(staging: Path, destination: Path) -> None:
+    """Swap a finished index into place. The previous index stays until the swap succeeds."""
+    if not destination.exists():
+        staging.rename(destination)
+        return
+    previous = destination.with_name(f".localkb-previous-{os.getpid()}")
+    if previous.exists():
+        shutil.rmtree(previous)
+    destination.rename(previous)
+    try:
+        staging.rename(destination)
+    except Exception:
+        if not destination.exists():
+            previous.rename(destination)
+        raise
+    shutil.rmtree(previous)
 
 
 def _write_meta(kb: Path, *, created: str, embedder: Embedder, files: int, chunks: int) -> None:

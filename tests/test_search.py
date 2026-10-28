@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from localkb.models import Hit
-from localkb.pipeline import search_kb
+from localkb.pipeline import init_kb, search_kb
 from localkb.prompt import build_prompt
 
 
@@ -41,6 +41,18 @@ def test_search_citations_for_each_format(corpus: Path) -> None:
     assert markdown.path == "notes/architecture.md"
     assert markdown.location == "Storage layout"
     assert markdown.score > 0
+
+
+def test_mixed_cjk_kana_and_hangul_queries(tmp_path: Path) -> None:
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "q.md").write_text("The figure is Q3營收 for the region.\n", encoding="utf-8")
+    (folder / "kana.md").write_text("カタカナの検索語です。\n", encoding="utf-8")
+    (folder / "hangul.md").write_text("한글 검색 테스트입니다.\n", encoding="utf-8")
+    init_kb(folder, embedder="hash")
+    assert search_kb(folder, "Q3 營收", k=3)[0].path == "q.md"
+    assert search_kb(folder, "カタカナ", k=3)[0].path == "kana.md"
+    assert search_kb(folder, "한글", k=3)[0].path == "hangul.md"
 
 
 def test_hidden_paths_are_not_searchable(corpus: Path) -> None:

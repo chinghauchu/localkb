@@ -39,12 +39,12 @@ The first `init` with the default embedder downloads a small ONNX model into you
 
 | Command | What it does |
 | --- | --- |
-| `localkb init <folder>` | Index the folder into `<folder>/.localkb/`. Refuses to replace an existing index unless `--force`. |
+| `localkb init <folder>` | Index the folder into `<folder>/.localkb/`. `--force` builds a replacement and swaps it in only after the new index succeeds. |
 | `localkb update [folder]` | Reindex only what changed. Prints added, modified, deleted, renamed, and elapsed time. |
 | `localkb search "q" [-k N] [--json]` | Hybrid search. `--json` prints machine-readable citations. |
 | `localkb ask "q" --copy` | Build a prompt that contains the question and cited excerpts, and copy it. Prints the prompt if the clipboard is unavailable. |
 | `localkb serve` | MCP over stdio. |
-| `localkb serve --http --port 8765 [--token …]` | MCP over streamable HTTP on `/mcp`. |
+| `localkb serve --http --port 8765 --token …` | MCP over streamable HTTP on `/mcp`. A token is required (`--token`, `LOCALKB_TOKEN`, or `--generate-token`). |
 | `localkb install claude\|cursor\|vscode\|gemini` | Merge an MCP entry into that client's config. Copies the previous file to `*.bak` first. |
 | `localkb status [folder]` | File count, chunk count, model, and index size. |
 
@@ -52,7 +52,11 @@ The first `init` with the default embedder downloads a small ONNX model into you
 
 ## Connect your AI
 
-`localkb install` records the absolute path of the folder. Move the folder, and run `install` again. Restart the client after writing its config. Every tool is read-only: `search`, `fetch`, `list_documents`, and `status`. The server instructions tell the model to cite the file and the location on every claim.
+`localkb install` records the absolute path of the folder in the client config (the config lives on this machine; MCP results do not repeat it). Move the folder, and run `install` again. Each install writes a new timestamped backup and leaves an existing `*.bak` alone. Restart the client after writing its config. Every tool is read-only: `search`, `fetch`, `list_documents`, and `status`. The server instructions tell the model to cite the file and the location on every claim.
+
+The first index with the default embedder downloads about 240 MB of ONNX weights into `~/.cache/localkb/fastembed`. That download is per machine, not per folder.
+
+If you run `install` from `uvx`, the config calls `uvx localkb serve` instead of the temporary interpreter. Until the package is available to `uvx`, install a stable command with `uv tool install --from <checkout> localkb` and run `install` again. The command prints that warning.
 
 ### Claude Desktop
 
@@ -94,11 +98,15 @@ ChatGPT on the web cannot start a local process, so this path uses HTTP plus a t
 
 ```bash
 localkb serve --http --port 8765 --token "$LOCALKB_TOKEN"
+# or mint one and print it on stderr:
+localkb serve --http --port 8765 --generate-token
 ```
 
-The process listens on `127.0.0.1:8765` and prints a warning. Endpoint: `http://127.0.0.1:8765/mcp`. Health check, with no document text: `http://127.0.0.1:8765/health`.
+HTTP mode refuses to start without a token. `--insecure-no-token` is the only exception, and only with `--host 127.0.0.1`. Any other bind address requires a token. `--host` must be the address clients send in the `Host` header; `0.0.0.0` is rejected because those checks would fail for every normal request.
 
-A tunnel (Tailscale, SSH, cloudflared, ngrok) lets a hosted assistant open that port. Anyone who can open the public URL can read excerpts. Prefer a private network, set a bearer token, and do not publish the URL. Host-header checks are off so a tunnel can rewrite `Host`; the token is what keeps casual clients out. Send `Authorization: Bearer <token>`.
+The process listens on `127.0.0.1:8765` by default and prints a warning. Endpoint: `http://127.0.0.1:8765/mcp`. Health check, with no document text: `http://127.0.0.1:8765/health`.
+
+Host and Origin are checked. A request whose `Host` is not the address you bound is rejected. A tunnel (Tailscale, SSH, cloudflared, ngrok) must present that host, for example by forwarding `Host: 127.0.0.1`. Anyone who can open the public URL and present the bearer token can read excerpts. Prefer a private network and do not publish the URL or the token.
 
 In ChatGPT developer mode, add an MCP server at the tunnel's `/mcp` URL. Tool names `search` and `fetch` follow the deep-research shape (`id`, `title`, `url`, and `fetch` returns `text` plus `metadata`) and also include the file, page, slide, or sheet.
 
@@ -151,13 +159,13 @@ flowchart TD
 
 `update` compares the folder to that image.
 
-- Same path, size, and mtime: left alone. This path does not hash or embed, so a quiet folder finishes quickly.
+- Same path, size, and mtime: left alone, unless that file failed to parse last time. Failures are retried. A quiet folder with no failures does not hash or embed.
 - Same path, different bytes: the old chunks are replaced.
 - Path gone: its chunks are removed.
 - A path disappears and one new path has the same content hash: treated as a rename or move. Vectors are kept and the path is rewritten. Two copies, or two files with the same hash moving at once, are not guessed; those are a delete plus an add.
 - Size or mtime changed but the hash matches: only the snapshot metadata is refreshed.
 
-Search runs vector cosine and FTS5, then fuses the two rankings with reciprocal rank fusion. Chinese and Japanese runs have no spaces, so keyword indexing inserts overlapping character bigrams (`知識庫` is stored as `知識` and `識庫`) while English words stay whole. The default model is `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 dimensions, CPU ONNX, no PyTorch). It truncates at 128 tokens, so localkb mean-pools overlapping windows before storing one vector per chunk. `--model jinaai/jina-embeddings-v2-base-zh` is a larger Chinese-English option with a long context, still via fastembed.
+Search runs vector cosine and FTS5, then fuses the two rankings with reciprocal rank fusion. Keyword indexing covers Han (simplified and traditional), Japanese kana, and Hangul. Those runs have no spaces, so each run is stored as overlapping bigrams (`知識庫` becomes `知識` and `識庫`) and padded so a mixed token matches a spaced query (`Q3營收` matches `Q3 營收`). Latin words stay whole. The default model is `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 dimensions, CPU ONNX, about 240 MB, no PyTorch). It truncates at 128 tokens, so localkb mean-pools overlapping windows before storing one vector per chunk. `--model jinaai/jina-embeddings-v2-base-zh` is a larger Chinese-English option with a long context, still via fastembed. Embeddings are requested in batches of 256, with progress on stderr.
 
 Vectors live in the SQLite file and are scanned exactly. That stays simple and portable for a personal library. It is the wrong shape for millions of chunks.
 
@@ -182,7 +190,7 @@ AnythingLLM, PrivateGPT, Khoj, and Open WebUI are stronger when you want a full 
 
 Parsing, embeddings, and search run on this computer. localkb has no account and does not send document text to a service of its own. The default model is an ONNX file downloaded from Hugging Face the first time you index; the download is the model, not your documents.
 
-An assistant receives excerpt text only when you connect one. MCP and `ask --copy` send the excerpts you retrieve into that product, under that product's own terms. HTTP mode serves excerpts to whoever can open the port. Use a bearer token and a private tunnel, and do not put the listener on the public internet.
+An assistant receives excerpt text only when you connect one. MCP and `ask --copy` send the excerpts you retrieve into that product, under that product's own terms. Citation URLs use the `localkb:///` scheme and the path inside the folder, not a `file://` path on this machine. `status` reports counts and the model, not the absolute folder. HTTP mode serves excerpts only to a client that presents the bearer token (unless you explicitly opt into `--insecure-no-token` on `127.0.0.1`). Use a private tunnel, and do not put the listener on the public internet.
 
 Use localkb with documents you are allowed to store, and with the assistants you are allowed to use. It is a personal index, not a way around someone else's rules.
 
@@ -231,7 +239,7 @@ Out of scope for 0.1: OCR, a chat UI, and cloud sync.
 - `.doc`, `.xls`, and `.ppt` are not supported.
 - The Ollama extra is a stub.
 - The package is not on PyPI. Install from this repo.
-- HTTP mode disables Host checks so tunnels work. A token and a localhost bind are the controls.
+- HTTP mode requires a bearer token. `--insecure-no-token` works only on `127.0.0.1`. Host and Origin are validated, so a tunnel has to present the bound host.
 - Clipboard support depends on a platform tool being installed.
 
 ## License

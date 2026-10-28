@@ -26,6 +26,14 @@ def test_ambiguous_duplicates_are_not_renames() -> None:
     assert plan.added == ["c.md"]
 
 
+def test_previous_parse_error_is_retried_even_when_mtime_matches() -> None:
+    old = {"a.md": {"size": 4, "mtime_ns": 9, "sha256": "keep", "error": "boom"}}
+    scanned = {"a.md": ScannedFile("a.md", size=4, mtime_ns=9, sha256="keep")}
+    plan = plan_changes(old, scanned)
+    assert plan.modified == ["a.md"]
+    assert plan.unchanged == []
+
+
 def test_same_size_and_mtime_is_unchanged_without_reading_hash() -> None:
     old = {"a.md": {"size": 4, "mtime_ns": 9, "sha256": "keep", "error": None}}
     scanned = {"a.md": ScannedFile("a.md", size=4, mtime_ns=9, sha256="")}
